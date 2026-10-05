@@ -9,6 +9,19 @@ Native PostgreSQL requires passwords for every role except `supabase_admin`. Its
 and password-reconciliation connection uses that administrative role, so a native
 `supabase_admin` connection is not password-checked.
 
+Native pg_cron runs each job in a background worker as one transaction, without transaction
+control (use `CALL` for procedures that commit) or session preload libraries. Explicit
+`BEGIN; ...; COMMIT;` job bodies fail with `EndTransactionBlock: unexpected state BEGIN`; remove
+the wrapper, since each job already runs in one transaction. The effective shared preload list
+includes `supautils` so jobs enforce reserved-role and membership policies. Native databases
+default `max_worker_processes` to 17 to leave room for cron workers beside the bundle's resident
+and parallel query workers. At most five cron jobs run at once by default; insufficient available
+worker capacity can cause job startup failures. Configuration files, includes, and `ALTER SYSTEM`
+values override the worker default, and `[db.settings]` overrides those values. Persistent
+configuration belongs in `PGDATA/postgresql.conf`, its includes, or `ALTER SYSTEM`;
+`SHOW config_file` identifies the temporary default-layer wrapper. Disposable shadow databases
+skip cron worker and shared-preload augmentation and keep pg_cron's default mode.
+
 | Command                  | Purpose                                                                           |
 | ------------------------ | --------------------------------------------------------------------------------- |
 | `supabase stack destroy` | Permanently delete one stack and its data.                                        |

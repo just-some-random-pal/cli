@@ -59,6 +59,7 @@ import {
   defaultNativeProcessLauncher,
   spawnNativeProcess,
   type NativeProcess,
+  type NativeProcessSpec,
 } from "../runtime/NativeProcess.ts";
 import type { StackId } from "../identity/StackId.ts";
 import {
@@ -92,7 +93,7 @@ export const DatabaseConfig = Schema.Struct({
   jwtSecret: Schema.Redacted(Schema.String),
   jwtExpiry: Schema.Finite,
   healthTimeoutMs: Schema.optionalKey(Schema.Finite),
-  /** When 0, the database is disposable and can use reduced-durability settings. */
+  /** When 0, the disposable/shadow profile uses reduced durability and skips cron worker policy augmentation. */
   stopGraceSeconds: Schema.optionalKey(Schema.Finite),
   rootKey: Schema.optionalKey(Schema.Redacted(Schema.String)),
   settings: Schema.optionalKey(
@@ -410,39 +411,47 @@ const removeOwnedRoot = (
     keep,
   );
 
-const nativeProcess = (
-  artifact: PreparedNativeArtifact,
-  config: DatabaseConfig,
-  paths: {
-    readonly dataPath: string;
-    readonly socketPath: string;
-    readonly hbaPath: string;
-    readonly rootKeyPath: string;
-  },
-  settings: ReadonlyArray<string>,
-  context: ServiceInstanceContext<DatabaseConfig>,
-  stackId: string,
-  instanceId: string,
-  spawner: ChildProcessSpawnerService["Service"],
-  user: PasswdEntry | undefined,
-): Effect.Effect<NativeProcess, ServiceError> =>
-  spawnNativeProcess(
-    {
+const nativeProcess = Effect.fn("Database.nativeProcess")(
+  function* (
+    artifact: PreparedNativeArtifact,
+    config: DatabaseConfig,
+    paths: {
+      readonly dataPath: string;
+      readonly socketPath: string;
+      readonly hbaPath: string;
+      readonly rootKeyPath: string;
+      readonly configPath?: string;
+    },
+    settings: ReadonlyArray<string>,
+    context: ServiceInstanceContext<DatabaseConfig>,
+    stackId: string,
+    instanceId: string,
+    spawner: ChildProcessSpawnerService["Service"],
+    user: PasswdEntry | undefined,
+    fs: FileSystem.FileSystem,
+  ): Effect.fn.Return<
+    NativeProcess,
+    ServiceError,
+    Scope.Scope | ChildProcessSpawner.ChildProcessSpawner
+  > {
+    const args = [
+      "-D",
+      paths.dataPath,
+      "-p",
+      "5432",
+      "-c",
+      "listen_addresses=",
+      "-c",
+      `unix_socket_directories=${paths.socketPath}`,
+      "-c",
+      `hba_file=${paths.hbaPath}`,
+      ...(config.stopGraceSeconds === 0 ? [] : ["-c", "cron.use_background_workers=on"]),
+      ...(paths.configPath === undefined ? [] : ["-c", `config_file=${paths.configPath}`]),
+      ...settings,
+    ];
+    const spec: NativeProcessSpec = {
       executable: artifact.executable,
       ...(user === undefined ? {} : { uid: user.uid, gid: user.gid, cwd: "/" }),
-      args: [
-        "-D",
-        paths.dataPath,
-        "-p",
-        "5432",
-        "-c",
-        "listen_addresses=",
-        "-c",
-        `unix_socket_directories=${paths.socketPath}`,
-        "-c",
-        `hba_file=${paths.hbaPath}`,
-        ...settings,
-      ],
       env: {
         ...(user === undefined ? {} : { HOME: user.home }),
         PGDATA: paths.dataPath,
@@ -453,14 +462,92 @@ const nativeProcess = (
       },
       gracefulStopSignal: "SIGINT",
       gracefulStopTimeout: "15 seconds",
-    },
-    defaultNativeProcessLauncher(),
-    { stackId, workloadId: instanceId },
-  ).pipe(
-    Scope.provide(context.scope),
-    Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-    Effect.mapError((cause) => errorFor("launch", cause)),
-  );
+    };
+    const preload =
+      config.stopGraceSeconds === 0
+        ? []
+        : yield* Effect.scoped(
+            Effect.gen(function* () {
+              const initialized = yield* fs.exists(`${paths.dataPath}/PG_VERSION`);
+              // First boot copies this template into PGDATA; its later appends never set shared_preload_libraries.
+              const probeArgs = initialized
+                ? args
+                : [
+                    "-D",
+                    paths.dataPath,
+                    "-c",
+                    `config_file=${artifact.root}/share/supabase-cli/config/postgresql.conf.template`,
+                    ...settings,
+                  ];
+              const probe = yield* spawnNativeProcess(
+                {
+                  ...spec,
+                  executable: `${artifact.root}/bin/postgres`,
+                  args: [...probeArgs, "-C", "shared_preload_libraries"],
+                },
+                defaultNativeProcessLauncher(),
+                { stackId, workloadId: instanceId },
+              );
+              const [stdout, stderr, code] = yield* Effect.all(
+                [
+                  probe.stdout.pipe(
+                    Stream.decodeText,
+                    Stream.runFold(
+                      () => "",
+                      (text, chunk) => (text + chunk).slice(-65537),
+                    ),
+                  ),
+                  probe.stderr.pipe(
+                    Stream.decodeText,
+                    Stream.runFold(
+                      () => "",
+                      (text, chunk) => (text + chunk).slice(-4096),
+                    ),
+                  ),
+                  probe.exitCode,
+                ],
+                { concurrency: "unbounded" },
+              );
+              yield* Effect.annotateCurrentSpan("process.exit_code", Number(code));
+              if (code !== 0)
+                return yield* errorFor(
+                  "exit",
+                  `${describePostgresExit(Number(code))}: ${stderr.trim() || stdout.trim() || "PostgreSQL configuration probe failed"}`,
+                );
+              if (stdout.length > 65536)
+                return yield* errorFor(
+                  "launch",
+                  "PostgreSQL preload configuration exceeds the probe limit",
+                );
+              const libraries = stdout.replace(/\n$/u, "");
+              // Cron workers skip session preloads, so the reserved-role policy must be shared-preloaded.
+              // PostgreSQL caches loaded modules, so appending the guard is safe even when already listed.
+              return [
+                "-c",
+                `shared_preload_libraries=${libraries}${libraries.trim() === "" ? "" : ","}supautils`,
+              ];
+            }),
+          ).pipe(
+            Effect.timeoutOrElse({
+              duration: config.healthTimeoutMs ?? 60_000,
+              orElse: () =>
+                Effect.fail(errorFor("launch", "PostgreSQL configuration probe timed out")),
+            }),
+            Effect.mapError((cause) => errorFor("launch", cause)),
+            Effect.withSpan("Database.resolveNativePreload"),
+          );
+    return yield* spawnNativeProcess(
+      { ...spec, args: [...args, ...preload] },
+      defaultNativeProcessLauncher(),
+      { stackId, workloadId: instanceId },
+    ).pipe(Effect.mapError((cause) => errorFor("launch", cause)));
+  },
+  (effect, _artifact, _config, _paths, _settings, context, _stackId, _instanceId, spawner) =>
+    effect.pipe(
+      Scope.provide(context.scope),
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+    ),
+);
 
 /** Creates a database component backed by one native or container PostgreSQL session. */
 export const makeDatabase = (
@@ -833,6 +920,22 @@ export const makeDatabase = (
             yield* fs
               .writeFileString(hbaPath, NATIVE_HBA_RULES, { mode: 0o600 })
               .pipe(Effect.mapError((cause) => errorFor("launch", cause)));
+            // Layer defaults beneath persistent config, includes, ALTER SYSTEM, and caller settings.
+            const configPath =
+              config.stopGraceSeconds === 0 ? undefined : path.join(socketPath, "postgresql.conf");
+            if (configPath !== undefined) {
+              const original = path
+                .resolve(dataPath, "postgresql.conf")
+                .replaceAll("\\", "\\\\")
+                .replaceAll("'", "''");
+              yield* fs
+                .writeFileString(
+                  configPath,
+                  `max_worker_processes = 17\ninclude = '${original}'\n`,
+                  { mode: 0o600 },
+                )
+                .pipe(Effect.mapError((cause) => errorFor("launch", cause)));
+            }
             const artifact = (yield* Ref.get(prepared)).get(config.version);
             if (artifact === undefined)
               return yield* errorFor("launch", `Artifact ${config.version} was not prepared`);
@@ -850,13 +953,20 @@ export const makeDatabase = (
             const process = yield* nativeProcess(
               artifact,
               config,
-              { dataPath, socketPath, hbaPath, rootKeyPath },
+              {
+                dataPath,
+                socketPath,
+                hbaPath,
+                rootKeyPath,
+                ...(configPath === undefined ? {} : { configPath }),
+              },
               settings,
               context,
               String(options.stackId),
               options.instanceId,
               spawner,
               stepDownUser,
+              fs,
             );
             const selectedEndpoint: BackendEndpoint = {
               kind: "unix",

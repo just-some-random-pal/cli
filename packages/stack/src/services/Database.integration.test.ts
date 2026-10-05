@@ -5,8 +5,10 @@ import {
   Context,
   Deferred,
   Effect,
+  Fiber,
   FileSystem,
   Layer,
+  Option,
   Path,
   Predicate,
   Redacted,
@@ -15,6 +17,7 @@ import {
 } from "effect";
 import { tmpdir } from "node:os";
 import { DEFAULT_POSTGRES_ROOT_KEY } from "../Defaults.ts";
+import { postgresVersion, prepareNativeArtifact } from "../Artifacts.ts";
 import { makeService } from "../Service.ts";
 import { makeDatabase, type BackendEndpoint, type DatabaseConfig } from "./Database.ts";
 import { makeDockerDatabaseRoot, runDocker } from "../../tests/docker-fixture.ts";
@@ -29,7 +32,7 @@ const config: DatabaseConfig = {
 
 const artifactCacheRoot = `${tmpdir()}/supabase-stack-artifacts`;
 
-const query = (
+const query = <Row extends object = object>(
   endpoint: BackendEndpoint,
   password: Redacted.Redacted<string>,
   statement: string,
@@ -48,7 +51,7 @@ const query = (
           password,
         }),
       );
-      return yield* Context.get(services, PgClient.PgClient).unsafe(statement);
+      return yield* Context.get(services, PgClient.PgClient).unsafe<Row>(statement);
     }),
   );
 
@@ -210,6 +213,270 @@ describe("database component", { timeout: 180_000 }, () => {
       }),
     ).pipe(Effect.provide(Layer.merge(NodeServices.layer, NodeHttpClient.layerNodeHttp))),
   );
+
+  for (const version of ["15", "17"])
+    it.live(`native PostgreSQL ${version} preserves cron role policies and shadow defaults`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const root = yield* fs.makeTempDirectoryScoped({ prefix: "stack-database-cron-" });
+          const database = yield* makeDatabase({
+            stackId: "stack-integration",
+            instanceId: "cron",
+            root,
+            cacheRoot: artifactCacheRoot,
+            runtime: "native",
+          });
+          const databaseConfig = { ...config, version };
+          const service = yield* makeService(database.definition, {
+            id: "database:cron",
+            config: databaseConfig,
+          });
+          yield* service.start;
+          yield* service.ready;
+          const endpoint = yield* database.endpoint;
+          const asPostgres = (statement: string) =>
+            query(endpoint, config.databasePassword, statement, "postgres", "postgres");
+          yield* asPostgres("CREATE EXTENSION pg_cron");
+          yield* query(
+            endpoint,
+            config.databasePassword,
+            `
+            CREATE TABLE cron_policy_probe (username text PRIMARY KEY);
+            CREATE FUNCTION report_cron_run() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+              PERFORM pg_notify('cron_runs',
+                (SELECT jobname FROM cron.job WHERE jobid = NEW.jobid) || ': ' ||
+                NEW.status || ': ' || coalesce(NEW.return_message, ''));
+              RETURN NEW;
+            END $$;
+            CREATE TRIGGER report_cron_run AFTER INSERT OR UPDATE ON cron.job_run_details
+              FOR EACH ROW WHEN (NEW.status IN ('succeeded', 'failed'))
+              EXECUTE FUNCTION report_cron_run();
+          `,
+          );
+          const rejected = yield* asPostgres("ALTER ROLE anon LOGIN").pipe(Effect.flip);
+          expect(Predicate.isTagged(rejected.reason, "AuthorizationError")).toBe(true);
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const services = yield* Layer.build(
+                PgClient.layer({
+                  host: endpoint.kind === "unix" ? endpoint.path : endpoint.host,
+                  port: endpoint.port,
+                  database: "postgres",
+                  username: "supabase_admin",
+                  password: config.databasePassword,
+                }),
+              );
+              const sql = Context.get(services, PgClient.PgClient);
+              for (const [name, statement, outcome] of [
+                [
+                  "own_job",
+                  "INSERT INTO cron_policy_probe SELECT current_user ON CONFLICT DO NOTHING",
+                  "succeeded: INSERT",
+                ],
+                [
+                  "reserved_role",
+                  "ALTER ROLE anon LOGIN",
+                  'failed: ERROR: "anon" is a reserved role',
+                ],
+              ]) {
+                // Each job has one statement; repeat runs tolerate a notification before LISTEN is ready.
+                const settled = yield* sql.listen("cron_runs").pipe(
+                  Stream.filter((message) => message.startsWith(`${name}: `)),
+                  Stream.runHead,
+                  Effect.forkScoped({ startImmediately: true }),
+                );
+                yield* asPostgres(`SELECT cron.schedule('${name}', '1 seconds', '${statement}')`);
+                const result = yield* Fiber.join(settled).pipe(Effect.timeout("60 seconds"));
+                expect(Option.getOrElse(result, () => "")).toContain(`${name}: ${outcome}`);
+                yield* asPostgres(`SELECT cron.unschedule('${name}')`);
+              }
+            }),
+          );
+          const workers =
+            "SELECT current_setting('max_worker_processes') AS workers, current_setting('cron.use_background_workers') AS cron";
+          expect(yield* query(endpoint, config.databasePassword, workers)).toEqual([
+            { workers: "17", cron: "on" },
+          ]);
+          const preloadQuery = "SELECT current_setting('shared_preload_libraries') AS libraries";
+          const preload = String(
+            (yield* query<{ libraries: string }>(
+              endpoint,
+              config.databasePassword,
+              preloadQuery,
+            ))[0]?.libraries,
+          );
+          expect(preload.split(",")).toContain("supautils");
+          const unguarded = preload
+            .split(",")
+            .filter((library) => library !== "supautils")
+            .join(",");
+          const dataPath = String(
+            (yield* query<{ directory: string }>(
+              endpoint,
+              config.databasePassword,
+              "SELECT current_setting('data_directory') AS directory",
+            ))[0]?.directory,
+          );
+          const originalConfig = yield* fs.readFileString(`${dataPath}/postgresql.conf`);
+          const includedPreload = `${unguarded},pg_buffercache`;
+          yield* fs.writeFileString(
+            `${dataPath}/cron-settings.conf`,
+            `max_worker_processes = 8\nshared_preload_libraries = '${includedPreload}'\n`,
+            { mode: 0o600 },
+          );
+          yield* fs.writeFileString(
+            `${dataPath}/postgresql.conf`,
+            `${originalConfig}\ninclude = 'cron-settings.conf'\n`,
+          );
+          yield* service.restart(databaseConfig);
+          yield* service.ready;
+          expect(yield* query(yield* database.endpoint, config.databasePassword, workers)).toEqual([
+            { workers: "8", cron: "on" },
+          ]);
+          expect(
+            yield* query(yield* database.endpoint, config.databasePassword, preloadQuery),
+          ).toEqual([{ libraries: `${includedPreload},supautils` }]);
+          const systemPreload = [...unguarded.split(","), "pg_buffercache", "pg_prewarm"].map(
+            (library) => library.trim(),
+          );
+          yield* query(
+            yield* database.endpoint,
+            config.databasePassword,
+            "ALTER SYSTEM SET max_worker_processes = 32",
+          );
+          yield* query(
+            yield* database.endpoint,
+            config.databasePassword,
+            `ALTER SYSTEM SET shared_preload_libraries = ${systemPreload.map((library) => `'${library}'`).join(", ")}`,
+          );
+          yield* service.restart(databaseConfig);
+          yield* service.ready;
+          expect(yield* query(yield* database.endpoint, config.databasePassword, workers)).toEqual([
+            { workers: "32", cron: "on" },
+          ]);
+          expect(
+            yield* query(yield* database.endpoint, config.databasePassword, preloadQuery),
+          ).toEqual([{ libraries: `${systemPreload.join(", ")},supautils` }]);
+          const callerPreload = `${unguarded},pg_buffercache,supautils`;
+          yield* service.restart({
+            ...databaseConfig,
+            settings: { max_worker_processes: 9, shared_preload_libraries: callerPreload },
+          });
+          yield* service.ready;
+          expect(yield* query(yield* database.endpoint, config.databasePassword, workers)).toEqual([
+            { workers: "9", cron: "on" },
+          ]);
+          expect(
+            yield* query(yield* database.endpoint, config.databasePassword, preloadQuery),
+          ).toEqual([{ libraries: `${callerPreload},supautils` }]);
+          const artifact = yield* prepareNativeArtifact(
+            { service: "database", version: postgresVersion(version) },
+            artifactCacheRoot,
+          );
+          const pgaudit = (yield* fs.exists(`${artifact.root}/lib/pgaudit.so`))
+            ? "pgaudit.so"
+            : "pgaudit.dylib";
+          const libraryDirectory = `${root}/a"b,supautils\nlibs`;
+          yield* fs.makeDirectory(libraryDirectory, { mode: 0o755 });
+          yield* fs.copyFile(`${artifact.root}/lib/${pgaudit}`, `${libraryDirectory}/${pgaudit}`);
+          yield* fs.chmod(`${libraryDirectory}/${pgaudit}`, 0o644);
+          const quotedPreload = unguarded
+            .split(",")
+            .map((library) =>
+              library.trim() === "pgaudit"
+                ? `"${libraryDirectory.replaceAll('"', '""')}/${pgaudit}"`
+                : library,
+            )
+            .join(",");
+          yield* service.restart({
+            ...databaseConfig,
+            settings: { shared_preload_libraries: quotedPreload },
+          });
+          yield* service.ready;
+          expect(
+            yield* query(
+              yield* database.endpoint,
+              config.databasePassword,
+              "SELECT current_setting('pgaudit.log') AS audit",
+            ),
+          ).toEqual([{ audit: "none" }]);
+          expect(
+            yield* query(yield* database.endpoint, config.databasePassword, preloadQuery),
+          ).toEqual([{ libraries: `${quotedPreload},supautils` }]);
+          yield* query(yield* database.endpoint, config.databasePassword, "ALTER SYSTEM RESET ALL");
+          yield* fs.writeFileString(`${dataPath}/postgresql.conf`, originalConfig);
+          yield* service.restart({ ...databaseConfig, stopGraceSeconds: 0 });
+          yield* service.ready;
+          expect(yield* query(yield* database.endpoint, config.databasePassword, workers)).toEqual([
+            { workers: "8", cron: "off" },
+          ]);
+          expect(
+            yield* query(yield* database.endpoint, config.databasePassword, preloadQuery),
+          ).toEqual([{ libraries: unguarded }]);
+          yield* service.destroy;
+        }),
+      ).pipe(Effect.provide(Layer.merge(NodeServices.layer, NodeHttpClient.layerNodeHttp))),
+    );
+
+  for (const version of ["15", "17"])
+    it.live(
+      `native PostgreSQL ${version} bounds configuration probes and first boots in the runtime session`,
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const fs = yield* FileSystem.FileSystem;
+            const root = yield* fs.makeTempDirectoryScoped({ prefix: "stack-database-probe-" });
+            const database = yield* makeDatabase({
+              stackId: "stack-integration",
+              instanceId: "probe",
+              root,
+              cacheRoot: artifactCacheRoot,
+              runtime: "native",
+            });
+            const databaseConfig: DatabaseConfig = { ...config, version };
+            const invalidConfig: DatabaseConfig = {
+              ...databaseConfig,
+              settings: { max_worker_processes: "invalid" },
+            };
+            const deadlineConfig: DatabaseConfig = { ...databaseConfig, healthTimeoutMs: 0 };
+            const service = yield* makeService(database.definition, {
+              id: "database:probe",
+              config: invalidConfig,
+            });
+            const output = yield* Ref.make("");
+            const firstBoot = yield* Deferred.make<void>();
+            yield* Stream.fromSubscription(yield* database.logs).pipe(
+              Stream.runForEach(({ bytes }) =>
+                Ref.updateAndGet(output, (text) => text + new TextDecoder().decode(bytes)).pipe(
+                  Effect.flatMap((text) =>
+                    text.includes("supabase-postgres: initializing database") &&
+                    text.includes("supabase-postgres: running bundled migrations")
+                      ? Deferred.succeed(firstBoot, undefined).pipe(Effect.asVoid)
+                      : Effect.void,
+                  ),
+                ),
+              ),
+              Effect.forkScoped({ startImmediately: true }),
+            );
+            const freshFailure = yield* service.start.pipe(Effect.flip);
+            expect(freshFailure).toMatchObject({ operation: "exit" });
+            expect(String(freshFailure)).toContain("invalid");
+            expect(yield* fs.readDirectory(`${root}/probe/data`)).toEqual([]);
+            const freshDeadline = yield* service.restart(deadlineConfig).pipe(Effect.flip);
+            expect(freshDeadline).toMatchObject({ operation: "launch" });
+            expect(String(freshDeadline)).toContain("PostgreSQL configuration probe timed out");
+            expect(yield* fs.readDirectory(`${root}/probe/data`)).toEqual([]);
+            yield* service.restart(databaseConfig);
+            yield* service.ready;
+            yield* Deferred.await(firstBoot).pipe(Effect.timeout("5 seconds"));
+            const probeDeadline = yield* service.restart(deadlineConfig).pipe(Effect.flip);
+            expect(probeDeadline).toMatchObject({ operation: "launch" });
+            expect(String(probeDeadline)).toContain("PostgreSQL configuration probe timed out");
+          }),
+        ).pipe(Effect.provide(Layer.merge(NodeServices.layer, NodeHttpClient.layerNodeHttp))),
+    );
 
   it.live(
     "persists SQL data across exact-session stop and reopen, isolates instances, and validates restart before stopping",
